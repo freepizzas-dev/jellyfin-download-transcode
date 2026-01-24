@@ -7483,7 +7483,28 @@ namespace MediaBrowser.Controller.MediaEncoding
             return " -codec:s:0 " + codec + " -disposition:s:0 default";
         }
 
+        /// <summary>
+        /// Gets the full ffmpeg command line for progressive video encoding.
+        /// </summary>
+        /// <param name="state">The encoding job info.</param>
+        /// <param name="encodingOptions">The encoding options.</param>
+        /// <param name="defaultPreset">The default encoder preset.</param>
+        /// <returns>The ffmpeg command line arguments.</returns>
         public string GetProgressiveVideoFullCommandLine(EncodingJobInfo state, EncodingOptions encodingOptions, EncoderPreset defaultPreset)
+        {
+            return GetProgressiveVideoFullCommandLine(state, encodingOptions, defaultPreset, useSingleFileHls: false, copyAllSubtitles: false);
+        }
+
+        /// <summary>
+        /// Gets the full ffmpeg command line for progressive video encoding.
+        /// </summary>
+        /// <param name="state">The encoding job info.</param>
+        /// <param name="encodingOptions">The encoding options.</param>
+        /// <param name="defaultPreset">The default encoder preset.</param>
+        /// <param name="useSingleFileHls">If true, outputs CMAF HLS with single_file for seekable progressive download.</param>
+        /// <param name="copyAllSubtitles">If true, copies all subtitle streams from source, preserving metadata; if false, uses standard subtitle handling.</param>
+        /// <returns>The ffmpeg command line arguments.</returns>
+        public string GetProgressiveVideoFullCommandLine(EncodingJobInfo state, EncodingOptions encodingOptions, EncoderPreset defaultPreset, bool useSingleFileHls, bool copyAllSubtitles)
         {
             // Get the output codec name
             var videoCodec = GetVideoEncoder(state, encodingOptions);
@@ -7491,31 +7512,62 @@ namespace MediaBrowser.Controller.MediaEncoding
             var format = string.Empty;
             var keyFrame = string.Empty;
             var outputPath = state.OutputFilePath;
+            var outputArgs = string.Empty;
 
-            if (Path.GetExtension(outputPath.AsSpan()).Equals(".mp4", StringComparison.OrdinalIgnoreCase)
+            if (useSingleFileHls)
+            {
+                // Use CMAF HLS for seekable progressive download.
+                // MKV writes SeekHead at the end, making the file unseekable during transcoding.
+                // CMAF HLS with single_file writes fragments progressively, enabling seeking during download.
+                // The output file (.m4s) contains the actual video data; the .m3u8 playlist is a side effect we ignore.
+                var m3u8PlaylistPath = Path.ChangeExtension(outputPath, ".m3u8");
+                format = " -f hls -hls_segment_type fmp4 -hls_playlist_type event -hls_flags independent_segments+single_file -hls_time 6 -movflags +hybrid_fragmented";
+                outputArgs = $"-hls_segment_filename \"{outputPath}\" -y \"{m3u8PlaylistPath}\"";
+            }
+            else if (Path.GetExtension(outputPath.AsSpan()).Equals(".mp4", StringComparison.OrdinalIgnoreCase)
                 && state.BaseRequest.Context == EncodingContext.Streaming)
             {
                 // Comparison: https://github.com/jansmolders86/mediacenterjs/blob/master/lib/transcoding/desktop.js
                 format = " -f mp4 -movflags frag_keyframe+empty_moov+delay_moov";
+                outputArgs = $"-y \"{outputPath}\"";
+            }
+            else
+            {
+                outputArgs = $"-y \"{outputPath}\"";
             }
 
             var threads = GetNumberOfThreads(state, encodingOptions, videoCodec);
 
             var inputModifier = GetInputModifier(state, encodingOptions, null);
 
+            // For downloads with copyAllSubtitles, map all subtitle streams and copy them
+            // Otherwise use standard streaming subtitle handling
+            var mapArgs = GetMapArgs(state);
+            var subtitleArgs = GetSubtitleEmbedArguments(state);
+            // Preserve stream metadata (language tags, etc.) for downloads, strip for streaming
+            var mapMetadata = copyAllSubtitles ? "-map_metadata 0" : "-map_metadata -1";
+            if (copyAllSubtitles)
+            {
+                // Add mapping for all subtitle streams (the ? makes it optional if no subs exist)
+                mapArgs += " -map 0:s?";
+                // Copy all subtitle codecs as-is
+                subtitleArgs = " -c:s copy";
+            }
+
             return string.Format(
                 CultureInfo.InvariantCulture,
-                "{0} {1}{2} {3} {4} -map_metadata -1 -map_chapters -1 -threads {5} {6}{7}{8} -y \"{9}\"",
+                "{0} {1}{2} {3} {4} {5} -map_chapters -1 -threads {6} {7}{8}{9} {10}",
                 inputModifier,
                 GetInputArgument(state, encodingOptions, null),
                 keyFrame,
-                GetMapArgs(state),
+                mapArgs,
                 GetProgressiveVideoArguments(state, encodingOptions, videoCodec, defaultPreset),
+                mapMetadata,
                 threads,
                 GetProgressiveVideoAudioArguments(state, encodingOptions),
-                GetSubtitleEmbedArguments(state),
+                subtitleArgs,
                 format,
-                outputPath).Trim();
+                outputArgs).Trim();
         }
 
         public string GetOutputFFlags(EncodingJobInfo state)

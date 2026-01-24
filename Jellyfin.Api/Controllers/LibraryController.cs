@@ -16,6 +16,7 @@ using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Extensions;
 using MediaBrowser.Common.Api;
+using MediaBrowser.Common.Configuration;
 using MediaBrowser.Common.Extensions;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Dto;
@@ -25,9 +26,12 @@ using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.IO;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Providers;
+using MediaBrowser.Controller.Streaming;
 using MediaBrowser.Model.Activity;
 using MediaBrowser.Model.Configuration;
+using MediaBrowser.Model.Dlna;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Globalization;
@@ -37,6 +41,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
+using Microsoft.Net.Http.Headers;
 
 namespace Jellyfin.Api.Controllers;
 
@@ -55,6 +60,10 @@ public class LibraryController : BaseJellyfinApiController
     private readonly ILibraryMonitor _libraryMonitor;
     private readonly ILogger<LibraryController> _logger;
     private readonly IServerConfigurationManager _serverConfigurationManager;
+    private readonly IMediaSourceManager _mediaSourceManager;
+    private readonly IMediaEncoder _mediaEncoder;
+    private readonly ITranscodeManager _transcodeManager;
+    private readonly EncodingHelper _encodingHelper;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="LibraryController"/> class.
@@ -68,6 +77,10 @@ public class LibraryController : BaseJellyfinApiController
     /// <param name="libraryMonitor">Instance of the <see cref="ILibraryMonitor"/> interface.</param>
     /// <param name="logger">Instance of the <see cref="ILogger{LibraryController}"/> interface.</param>
     /// <param name="serverConfigurationManager">Instance of the <see cref="IServerConfigurationManager"/> interface.</param>
+    /// <param name="mediaSourceManager">Instance of the <see cref="IMediaSourceManager"/> interface.</param>
+    /// <param name="mediaEncoder">Instance of the <see cref="IMediaEncoder"/> interface.</param>
+    /// <param name="transcodeManager">Instance of the <see cref="ITranscodeManager"/> interface.</param>
+    /// <param name="encodingHelper">Instance of <see cref="EncodingHelper"/>.</param>
     public LibraryController(
         IProviderManager providerManager,
         ILibraryManager libraryManager,
@@ -77,7 +90,11 @@ public class LibraryController : BaseJellyfinApiController
         ILocalizationManager localization,
         ILibraryMonitor libraryMonitor,
         ILogger<LibraryController> logger,
-        IServerConfigurationManager serverConfigurationManager)
+        IServerConfigurationManager serverConfigurationManager,
+        IMediaSourceManager mediaSourceManager,
+        IMediaEncoder mediaEncoder,
+        ITranscodeManager transcodeManager,
+        EncodingHelper encodingHelper)
     {
         _providerManager = providerManager;
         _libraryManager = libraryManager;
@@ -88,6 +105,10 @@ public class LibraryController : BaseJellyfinApiController
         _libraryMonitor = libraryMonitor;
         _logger = logger;
         _serverConfigurationManager = serverConfigurationManager;
+        _mediaSourceManager = mediaSourceManager;
+        _mediaEncoder = mediaEncoder;
+        _transcodeManager = transcodeManager;
+        _encodingHelper = encodingHelper;
     }
 
     /// <summary>
@@ -657,6 +678,9 @@ public class LibraryController : BaseJellyfinApiController
     /// Downloads item media.
     /// </summary>
     /// <param name="itemId">The item id.</param>
+    /// <param name="videoBitrate">Optional. For video items, specify the total bitrate to transcode to, in bits per second (e.g., 2000000 for 2 Mbps). Ignored for audio items.</param>
+    /// <param name="downmixToStereo">Optional. If true, downmix surround sound audio to stereo. Has no effect if audio is already stereo or mono. Ignored for audio items.</param>
+    /// <param name="container">Optional. Output container format: 'mp4' (default, seekable during download) or 'mkv' (supports embedded subtitles but not seekable on some players).</param>
     /// <response code="200">Media downloaded.</response>
     /// <response code="404">Item not found.</response>
     /// <returns>A <see cref="FileResult"/> containing the media stream.</returns>
@@ -666,7 +690,11 @@ public class LibraryController : BaseJellyfinApiController
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     [ProducesFile("video/*", "audio/*")]
-    public async Task<ActionResult> GetDownload([FromRoute, Required] Guid itemId)
+    public async Task<ActionResult> GetDownload(
+        [FromRoute, Required] Guid itemId,
+        [FromQuery] int? videoBitrate,
+        [FromQuery] bool downmixToStereo = false,
+        [FromQuery] string container = "mp4")
     {
         var userId = User.GetUserId();
         var user = userId.IsEmpty()
@@ -698,21 +726,145 @@ public class LibraryController : BaseJellyfinApiController
             await LogDownloadAsync(item, user).ConfigureAwait(false);
         }
 
-        // Quotes are valid in linux. They'll possibly cause issues here.
-        var filename = Path.GetFileName(item.Path)?.Replace("\"", string.Empty, StringComparison.Ordinal);
+        // Check if transcoding is needed (only for video items)
+        MediaSourceInfo? mediaSource = null;
+        MediaStream? audioStream = null;
+        var needsDownmix = false;
+        var needsBitrateReduction = false;
 
-        var filePath = item.Path;
-        if (item.IsFileProtocol)
+        if (item is Video)
         {
-            // PhysicalFile does not work well with symlinks at the moment.
-            var resolved = FileSystemHelper.ResolveLinkTarget(filePath, returnFinalTarget: true);
-            if (resolved is not null && resolved.Exists)
+            // Get media source to check original bitrate
+            var mediaSources = await _mediaSourceManager.GetPlaybackMediaSources(item, user, false, false, CancellationToken.None).ConfigureAwait(false);
+            mediaSource = mediaSources.FirstOrDefault();
+            if (mediaSource is null)
             {
-                filePath = resolved.FullName;
+                return NotFound();
             }
+
+            // Check if downmixing is actually needed (audio has more than 2 channels)
+            audioStream = mediaSource.GetDefaultAudioStream(-1);
+            needsDownmix = downmixToStereo && audioStream?.Channels > 2;
+
+            // Determine if we need to reduce bitrate (vs just downmixing audio)
+            needsBitrateReduction = videoBitrate.HasValue
+                && mediaSource.Bitrate.HasValue
+                && videoBitrate.Value < mediaSource.Bitrate.Value;
         }
 
-        return PhysicalFile(filePath, MimeTypes.GetMimeType(filePath), filename, true);
+        // Return original file if no transcoding is needed
+        if (!needsDownmix && !needsBitrateReduction)
+        {
+            // Quotes are valid in linux. They'll possibly cause issues here.
+            var filename = Path.GetFileName(item.Path)?.Replace("\"", string.Empty, StringComparison.Ordinal);
+
+            var filePath = item.Path;
+            if (item.IsFileProtocol)
+            {
+                // PhysicalFile does not work well with symlinks at the moment.
+                var resolved = FileSystemHelper.ResolveLinkTarget(filePath, returnFinalTarget: true);
+                if (resolved is not null && resolved.Exists)
+                {
+                    filePath = resolved.FullName;
+                }
+            }
+
+            return PhysicalFile(filePath, MimeTypes.GetMimeType(filePath), filename, true);
+        }
+
+        // Calculate output audio channels (stereo if downmixing, otherwise preserve original)
+        var outputAudioChannels = downmixToStereo ? 2 : audioStream?.Channels;
+
+        // Use original bitrate if none specified (e.g., downmix only)
+        // If mediaSource.Bitrate is null, use a reasonable default
+        // Note: mediaSource is guaranteed non-null here since we're in the transcoding path (needsDownmix || needsBitrateReduction)
+        var targetBitrate = videoBitrate ?? mediaSource!.Bitrate ?? 1500000;
+
+        // Use EncodingHelper to calculate audio bitrate based on codec and channels
+        var calculatedAudioBitrate = _encodingHelper.GetAudioBitrateParam(
+            audioBitRate: null,
+            audioCodec: "aac",
+            audioStream: audioStream,
+            outputAudioChannels: outputAudioChannels) ?? 128000;
+
+        // Cap audio bitrate based on total bitrate - matches StreamBuilder.GetMaxAudioBitrateForTotalBitrate
+        var maxAudioBitrate = GetMaxAudioBitrateForTotalBitrate(targetBitrate);
+        var audioBitrate = Math.Min(calculatedAudioBitrate, maxAudioBitrate);
+
+        // Calculate video bitrate by subtracting audio bitrate from total
+        var videoOutputBitrate = targetBitrate - audioBitrate;
+
+        var cancellationTokenSource = new CancellationTokenSource();
+
+        // Normalize container parameter
+        var useMkv = string.Equals(container, "mkv", StringComparison.OrdinalIgnoreCase);
+        var outputContainer = useMkv ? "mkv" : "m4s";
+        var downloadExtension = useMkv ? ".mkv" : ".mp4";
+
+        var streamingRequest = new VideoRequestDto
+        {
+            Id = itemId,
+            Container = outputContainer,
+            Static = false,
+            MediaSourceId = itemId.ToString("N"),
+            VideoCodec = needsBitrateReduction ? "h264" : null,
+            AudioCodec = "aac",
+            VideoBitRate = needsBitrateReduction ? videoOutputBitrate : null,
+            AudioBitRate = audioBitrate,
+            MaxAudioChannels = downmixToStereo ? 2 : null,
+            // MKV supports embedded subtitles, fMP4/CMAF does not
+            SubtitleMethod = useMkv ? SubtitleDeliveryMethod.Embed : SubtitleDeliveryMethod.Drop,
+            Context = EncodingContext.Static,
+            EnableAutoStreamCopy = !needsBitrateReduction,
+            AllowAudioStreamCopy = false,
+            AllowVideoStreamCopy = !needsBitrateReduction,
+            CopyTimestamps = true,
+            EnableAudioVbrEncoding = true,
+            PlaySessionId = Guid.NewGuid().ToString("N")
+        };
+
+        var state = await StreamingHelpers.GetStreamingState(
+                streamingRequest,
+                HttpContext,
+                _mediaSourceManager,
+                _userManager,
+                _libraryManager,
+                _serverConfigurationManager,
+                _mediaEncoder,
+                _encodingHelper,
+                _transcodeManager,
+                TranscodingJobType.Progressive,
+                cancellationTokenSource.Token)
+            .ConfigureAwait(false);
+
+        // Generate download filename with appropriate extension
+        var baseName = Path.GetFileNameWithoutExtension(item.Path)?.Replace("\"", string.Empty, StringComparison.Ordinal) ?? item.Name;
+        var downloadFilename = $"{baseName}{downloadExtension}";
+
+        // Set headers for download with proper RFC 5987 encoding for special characters
+        var contentDisposition = new ContentDispositionHeaderValue("attachment");
+        contentDisposition.SetHttpFileName(downloadFilename);
+        Response.Headers[HeaderNames.ContentDisposition] = contentDisposition.ToString();
+
+        // Get the transcoded file
+        // For fMP4/CMAF (default): use useSingleFileHls=true for seekable progressive download
+        // For MKV: use useSingleFileHls=false (standard progressive, subtitles work but not seekable until complete)
+        var encodingOptions = _serverConfigurationManager.GetEncodingOptions();
+        var ffmpegCommandLineArguments = _encodingHelper.GetProgressiveVideoFullCommandLine(
+            state,
+            encodingOptions,
+            EncoderPreset.medium,
+            useSingleFileHls: !useMkv,
+            copyAllSubtitles: useMkv);
+
+        return await FileStreamResponseHelpers.GetTranscodedFile(
+            state,
+            isHeadRequest: false,
+            HttpContext,
+            _transcodeManager,
+            ffmpegCommandLineArguments,
+            TranscodingJobType.Progressive,
+            cancellationTokenSource).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -935,6 +1087,22 @@ public class LibraryController : BaseJellyfinApiController
         result.TypeOptions = typeOptions.ToArray();
 
         return result;
+    }
+
+    private static int GetMaxAudioBitrateForTotalBitrate(int totalBitrate)
+    {
+        return totalBitrate switch
+        {
+            <= 640000 => 128000,
+            <= 2000000 => 384000,
+            <= 3000000 => 448000,
+            <= 4000000 => 640000,
+            <= 5000000 => 768000,
+            <= 10000000 => 1536000,
+            <= 15000000 => 2304000,
+            <= 20000000 => 3584000,
+            _ => 7168000
+        };
     }
 
     private int GetCount(BaseItemKind itemKind, User? user, bool? isFavorite)
