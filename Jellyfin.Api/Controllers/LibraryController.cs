@@ -853,7 +853,7 @@ public class LibraryController : BaseJellyfinApiController
         var ffmpegCommandLineArguments = _encodingHelper.GetProgressiveVideoFullCommandLine(
             state,
             encodingOptions,
-            EncoderPreset.medium,
+            EncoderPreset.veryfast,
             useSingleFileHls: !useMkv,
             copyAllSubtitles: useMkv);
 
